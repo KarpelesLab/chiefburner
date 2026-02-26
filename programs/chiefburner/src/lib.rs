@@ -48,6 +48,12 @@ pub mod chiefburner {
             },
         ))?;
 
+        // Verify the account was actually closed
+        require!(
+            ctx.accounts.token_account.to_account_info().lamports() == 0,
+            ChiefburnerError::CloseDidNotSucceed
+        );
+
         // Calculate fees
         let cranker_fee = rent_lamports
             .checked_mul(CRANKER_FEE_BPS)
@@ -225,4 +231,6 @@ pub enum ChiefburnerError {
     Unauthorized,
     #[msg("No fees available to collect")]
     NoFeesToCollect,
+    #[msg("Token account close did not succeed")]
+    CloseDidNotSucceed,
 }
