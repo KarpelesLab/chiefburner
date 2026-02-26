@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SOLANA_VERSION: v3.1.8
+
+jobs:
+  verifiable-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - name: Install solana-verify
+        run: cargo install solana-verify --version 0.4.11
+
+      - name: Build verifiable binary
+        run: solana-verify build --library-name chiefburner
+
+      - name: Print executable hash
+        run: solana-verify get-executable-hash target/deploy/chiefburner.so
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiefburner-verifiable
+          path: target/deploy/chiefburner.so
+          retention-days: 90

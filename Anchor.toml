@@ -1,0 +1,19 @@
+[toolchain]
+solana_version = "3.1.8"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+chiefburner = "8CJi79SkfMYN29XX4WmBT8AmtvCrAzzrFYJsdai6oKwL"
+
+[programs.mainnet]
+chiefburner = "8CJi79SkfMYN29XX4WmBT8AmtvCrAzzrFYJsdai6oKwL"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"

@@ -1,0 +1,20 @@
+[package]
+name = "chiefburner"
+version = "0.1.0"
+edition = "2021"
+description = "Permissionless token account closer with cranker rewards"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "chiefburner"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.32.0"
+anchor-spl = "0.32.0"
