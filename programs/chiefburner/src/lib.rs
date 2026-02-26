@@ -70,6 +70,45 @@ pub mod chiefburner {
 
         Ok(())
     }
+
+    /// Close a token account and send all reclaimed rent to the cranker.
+    ///
+    /// The owner signs to authorize, but forfeits the rent entirely.
+    /// Useful for users who just want empty accounts cleaned up.
+    /// The token account must have zero balance.
+    pub fn burn_and_close_free(ctx: Context<BurnAndCloseFree>) -> Result<()> {
+        let token_account = &ctx.accounts.token_account;
+
+        require!(token_account.amount == 0, ChiefburnerError::NonZeroBalance);
+
+        let rent_lamports = token_account.to_account_info().lamports();
+
+        // Close the token account — rent goes directly to the cranker
+        close_account(CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.token_account.to_account_info(),
+                destination: ctx.accounts.cranker.to_account_info(),
+                authority: ctx.accounts.owner.to_account_info(),
+            },
+        ))?;
+
+        require!(
+            ctx.accounts.token_account.to_account_info().lamports() == 0,
+            ChiefburnerError::CloseDidNotSucceed
+        );
+
+        emit!(AccountClosed {
+            token_account: ctx.accounts.token_account.key(),
+            mint: ctx.accounts.mint.key(),
+            owner: ctx.accounts.owner.key(),
+            cranker: ctx.accounts.cranker.key(),
+            rent_reclaimed: rent_lamports,
+            cranker_fee: rent_lamports,
+        });
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -90,6 +129,31 @@ pub struct BurnAndClose<'info> {
     pub owner: Signer<'info>,
 
     /// The cranker submitting the transaction. Receives 5% of reclaimed rent.
+    /// CHECK: Any account can be the cranker — this is permissionless.
+    #[account(mut)]
+    pub cranker: UncheckedAccount<'info>,
+
+    /// The token program (supports both Token and Token-2022).
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct BurnAndCloseFree<'info> {
+    /// The token account to close. Must have zero balance.
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = owner,
+    )]
+    pub token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// The mint of the token account.
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    /// The owner of the token account. Must sign to authorize closing.
+    pub owner: Signer<'info>,
+
+    /// The cranker submitting the transaction. Receives 100% of reclaimed rent.
     /// CHECK: Any account can be the cranker — this is permissionless.
     #[account(mut)]
     pub cranker: UncheckedAccount<'info>,
