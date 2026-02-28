@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{instruction::Instruction, program::invoke};
 use anchor_spl::token_interface::{
-    burn, close_account, Burn, CloseAccount, Mint, TokenAccount, TokenInterface,
+    burn, close_account, Burn, CloseAccount, TokenInterface,
 };
 
 declare_id!("8CJi79SkfMYN29XX4WmBT8AmtvCrAzzrFYJsdai6oKwL");
@@ -18,9 +18,19 @@ const METAPLEX_METADATA_PROGRAM: Pubkey =
 const NAME_SERVICE_PROGRAM: Pubkey =
     pubkey!("namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX");
 
-/// Transfer cranker fee (5%) from owner to cranker. Returns the fee amount.
+/// Parse mint, owner, and amount from an SPL token account's raw data.
+/// Layout is identical for both SPL Token and Token-2022.
+fn parse_token_account(data: &[u8]) -> Result<(Pubkey, Pubkey, u64)> {
+    require!(data.len() >= 72, ChiefburnerError::InvalidAccount);
+    let mint = Pubkey::try_from(&data[0..32]).unwrap();
+    let owner = Pubkey::try_from(&data[32..64]).unwrap();
+    let amount = u64::from_le_bytes(data[64..72].try_into().unwrap());
+    Ok((mint, owner, amount))
+}
+
+/// Transfer cranker fee (5%) from source to cranker. Returns the fee amount.
 fn transfer_cranker_fee<'info>(
-    owner: &AccountInfo<'info>,
+    source: &AccountInfo<'info>,
     cranker: &AccountInfo<'info>,
     rent_lamports: u64,
 ) -> Result<u64> {
@@ -30,8 +40,8 @@ fn transfer_cranker_fee<'info>(
         .checked_div(BPS_DENOMINATOR)
         .unwrap();
 
-    if cranker_fee > 0 && cranker.key() != owner.key() {
-        **owner.try_borrow_mut_lamports()? -= cranker_fee;
+    if cranker_fee > 0 && cranker.key() != source.key() {
+        **source.try_borrow_mut_lamports()? -= cranker_fee;
         **cranker.try_borrow_mut_lamports()? += cranker_fee;
     }
 
@@ -43,141 +53,195 @@ pub mod chiefburner {
     use super::*;
 
     // ── Token instructions ──────────────────────────────────────────
+    //
+    // remaining_accounts: pairs of (token_account, mint) to burn+close.
+    // All token accounts must belong to the owner and the same token program.
 
-    /// Burn any remaining tokens and close the account.
+    /// Batch burn tokens and close accounts.
     /// Splits reclaimed rent: 5% to cranker, 95% to owner.
     pub fn burn_and_close(ctx: Context<BurnAndClose>) -> Result<()> {
-        let token_account = &ctx.accounts.token_account;
-        let rent_lamports = token_account.to_account_info().lamports();
-
-        // Burn tokens if non-zero balance
-        if token_account.amount > 0 {
-            burn(
-                CpiContext::new(
-                    ctx.accounts.token_program.to_account_info(),
-                    Burn {
-                        mint: ctx.accounts.mint.to_account_info(),
-                        from: ctx.accounts.token_account.to_account_info(),
-                        authority: ctx.accounts.owner.to_account_info(),
-                    },
-                ),
-                token_account.amount,
-            )?;
-        }
-
-        // Close the token account — rent goes to owner
-        close_account(CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            CloseAccount {
-                account: ctx.accounts.token_account.to_account_info(),
-                destination: ctx.accounts.owner.to_account_info(),
-                authority: ctx.accounts.owner.to_account_info(),
-            },
-        ))?;
-
+        let remaining = &ctx.remaining_accounts;
         require!(
-            ctx.accounts.token_account.to_account_info().lamports() == 0,
-            ChiefburnerError::CloseDidNotSucceed
+            remaining.len() >= 2 && remaining.len() % 2 == 0,
+            ChiefburnerError::InvalidBatch
         );
+
+        let owner_key = ctx.accounts.owner.key();
+        let token_program = &ctx.accounts.token_program;
+        let token_program_id = token_program.key();
+        let mut total_rent: u64 = 0;
+
+        for chunk in remaining.chunks(2) {
+            let token_info = &chunk[0];
+            let mint_info = &chunk[1];
+
+            require!(
+                *token_info.owner == token_program_id,
+                ChiefburnerError::InvalidAccount
+            );
+
+            let (mint_key, authority, amount) =
+                parse_token_account(&token_info.try_borrow_data()?)?;
+            require!(authority == owner_key, ChiefburnerError::InvalidAccount);
+            require!(mint_key == mint_info.key(), ChiefburnerError::InvalidAccount);
+
+            let rent = token_info.lamports();
+            total_rent = total_rent.checked_add(rent).unwrap();
+
+            if amount > 0 {
+                burn(
+                    CpiContext::new(
+                        token_program.to_account_info(),
+                        Burn {
+                            mint: mint_info.to_account_info(),
+                            from: token_info.to_account_info(),
+                            authority: ctx.accounts.owner.to_account_info(),
+                        },
+                    ),
+                    amount,
+                )?;
+            }
+
+            close_account(CpiContext::new(
+                token_program.to_account_info(),
+                CloseAccount {
+                    account: token_info.to_account_info(),
+                    destination: ctx.accounts.owner.to_account_info(),
+                    authority: ctx.accounts.owner.to_account_info(),
+                },
+            ))?;
+        }
 
         let cranker_fee = transfer_cranker_fee(
             &ctx.accounts.owner.to_account_info(),
             &ctx.accounts.cranker,
-            rent_lamports,
+            total_rent,
         )?;
 
-        emit!(AccountClosed {
-            token_account: ctx.accounts.token_account.key(),
-            mint: ctx.accounts.mint.key(),
-            owner: ctx.accounts.owner.key(),
+        emit!(TokensBurned {
+            owner: owner_key,
             cranker: ctx.accounts.cranker.key(),
-            rent_reclaimed: rent_lamports,
+            count: (remaining.len() / 2) as u32,
+            total_rent_reclaimed: total_rent,
             cranker_fee,
         });
 
         Ok(())
     }
 
-    /// Burn any remaining tokens and close the account.
+    /// Batch burn tokens and close accounts.
     /// All reclaimed rent goes to the cranker.
     pub fn burn_and_close_free(ctx: Context<BurnAndCloseFree>) -> Result<()> {
-        let token_account = &ctx.accounts.token_account;
-        let rent_lamports = token_account.to_account_info().lamports();
-
-        if token_account.amount > 0 {
-            burn(
-                CpiContext::new(
-                    ctx.accounts.token_program.to_account_info(),
-                    Burn {
-                        mint: ctx.accounts.mint.to_account_info(),
-                        from: ctx.accounts.token_account.to_account_info(),
-                        authority: ctx.accounts.owner.to_account_info(),
-                    },
-                ),
-                token_account.amount,
-            )?;
-        }
-
-        // Close — rent goes directly to cranker
-        close_account(CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            CloseAccount {
-                account: ctx.accounts.token_account.to_account_info(),
-                destination: ctx.accounts.cranker.to_account_info(),
-                authority: ctx.accounts.owner.to_account_info(),
-            },
-        ))?;
-
+        let remaining = &ctx.remaining_accounts;
         require!(
-            ctx.accounts.token_account.to_account_info().lamports() == 0,
-            ChiefburnerError::CloseDidNotSucceed
+            remaining.len() >= 2 && remaining.len() % 2 == 0,
+            ChiefburnerError::InvalidBatch
         );
 
-        emit!(AccountClosed {
-            token_account: ctx.accounts.token_account.key(),
-            mint: ctx.accounts.mint.key(),
-            owner: ctx.accounts.owner.key(),
+        let owner_key = ctx.accounts.owner.key();
+        let token_program = &ctx.accounts.token_program;
+        let token_program_id = token_program.key();
+        let mut total_rent: u64 = 0;
+
+        for chunk in remaining.chunks(2) {
+            let token_info = &chunk[0];
+            let mint_info = &chunk[1];
+
+            require!(
+                *token_info.owner == token_program_id,
+                ChiefburnerError::InvalidAccount
+            );
+
+            let (mint_key, authority, amount) =
+                parse_token_account(&token_info.try_borrow_data()?)?;
+            require!(authority == owner_key, ChiefburnerError::InvalidAccount);
+            require!(mint_key == mint_info.key(), ChiefburnerError::InvalidAccount);
+
+            let rent = token_info.lamports();
+            total_rent = total_rent.checked_add(rent).unwrap();
+
+            if amount > 0 {
+                burn(
+                    CpiContext::new(
+                        token_program.to_account_info(),
+                        Burn {
+                            mint: mint_info.to_account_info(),
+                            from: token_info.to_account_info(),
+                            authority: ctx.accounts.owner.to_account_info(),
+                        },
+                    ),
+                    amount,
+                )?;
+            }
+
+            close_account(CpiContext::new(
+                token_program.to_account_info(),
+                CloseAccount {
+                    account: token_info.to_account_info(),
+                    destination: ctx.accounts.cranker.to_account_info(),
+                    authority: ctx.accounts.owner.to_account_info(),
+                },
+            ))?;
+        }
+
+        emit!(TokensBurned {
+            owner: owner_key,
             cranker: ctx.accounts.cranker.key(),
-            rent_reclaimed: rent_lamports,
-            cranker_fee: rent_lamports,
+            count: (remaining.len() / 2) as u32,
+            total_rent_reclaimed: total_rent,
+            cranker_fee: total_rent,
         });
 
         Ok(())
     }
 
     // ── NFT instructions (Metaplex Token Metadata) ──────────────────
+    //
+    // remaining_accounts: groups of 4 per NFT:
+    //   (metadata, mint, token_account, master_edition)
 
-    /// Burn a regular NFT via Metaplex and split recovered rent (~0.015 SOL).
-    /// 5% to cranker, 95% to owner.
+    /// Batch burn NFTs via Metaplex. 5% to cranker, 95% to owner.
     pub fn burn_nft(ctx: Context<BurnNft>) -> Result<()> {
+        let remaining = &ctx.remaining_accounts;
+        require!(
+            remaining.len() >= 4 && remaining.len() % 4 == 0,
+            ChiefburnerError::InvalidBatch
+        );
+
         let owner_info = ctx.accounts.owner.to_account_info();
         let lamports_before = owner_info.lamports();
 
-        // CPI: Metaplex BurnNft (instruction discriminator = 18)
-        let ix = Instruction {
-            program_id: METAPLEX_METADATA_PROGRAM,
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.metadata.key(), false),
-                AccountMeta::new(ctx.accounts.owner.key(), true),
-                AccountMeta::new(ctx.accounts.mint.key(), false),
-                AccountMeta::new(ctx.accounts.token_account.key(), false),
-                AccountMeta::new(ctx.accounts.master_edition.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-            ],
-            data: vec![18], // BurnNft discriminator
-        };
+        for chunk in remaining.chunks(4) {
+            let metadata = &chunk[0];
+            let mint = &chunk[1];
+            let token_account = &chunk[2];
+            let master_edition = &chunk[3];
 
-        invoke(
-            &ix,
-            &[
-                ctx.accounts.metadata.to_account_info(),
-                owner_info.clone(),
-                ctx.accounts.mint.to_account_info(),
-                ctx.accounts.token_account.to_account_info(),
-                ctx.accounts.master_edition.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
-            ],
-        )?;
+            let ix = Instruction {
+                program_id: METAPLEX_METADATA_PROGRAM,
+                accounts: vec![
+                    AccountMeta::new(metadata.key(), false),
+                    AccountMeta::new(ctx.accounts.owner.key(), true),
+                    AccountMeta::new(mint.key(), false),
+                    AccountMeta::new(token_account.key(), false),
+                    AccountMeta::new(master_edition.key(), false),
+                    AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                ],
+                data: vec![18],
+            };
+
+            invoke(
+                &ix,
+                &[
+                    metadata.to_account_info(),
+                    owner_info.clone(),
+                    mint.to_account_info(),
+                    token_account.to_account_info(),
+                    master_edition.to_account_info(),
+                    ctx.accounts.token_program.to_account_info(),
+                ],
+            )?;
+        }
 
         let rent_reclaimed = owner_info
             .lamports()
@@ -190,48 +254,59 @@ pub mod chiefburner {
             rent_reclaimed,
         )?;
 
-        emit!(NftBurned {
+        emit!(NftsBurned {
             owner: ctx.accounts.owner.key(),
-            mint: ctx.accounts.mint.key(),
             cranker: ctx.accounts.cranker.key(),
-            rent_reclaimed,
+            count: (remaining.len() / 4) as u32,
+            total_rent_reclaimed: rent_reclaimed,
             cranker_fee,
         });
 
         Ok(())
     }
 
-    /// Burn a regular NFT via Metaplex. All recovered rent to cranker.
-    pub fn burn_nft_free(ctx: Context<BurnNftFree>) -> Result<()> {
-        // Rent goes to cranker by passing cranker as the "owner" destination
-        // But Metaplex sends rent to the NFT owner, so we close into owner then transfer all
+    /// Batch burn NFTs via Metaplex. All recovered rent to cranker.
+    pub fn burn_nft_free(ctx: Context<BurnNft>) -> Result<()> {
+        let remaining = &ctx.remaining_accounts;
+        require!(
+            remaining.len() >= 4 && remaining.len() % 4 == 0,
+            ChiefburnerError::InvalidBatch
+        );
+
         let owner_info = ctx.accounts.owner.to_account_info();
         let lamports_before = owner_info.lamports();
 
-        let ix = Instruction {
-            program_id: METAPLEX_METADATA_PROGRAM,
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.metadata.key(), false),
-                AccountMeta::new(ctx.accounts.owner.key(), true),
-                AccountMeta::new(ctx.accounts.mint.key(), false),
-                AccountMeta::new(ctx.accounts.token_account.key(), false),
-                AccountMeta::new(ctx.accounts.master_edition.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-            ],
-            data: vec![18],
-        };
+        for chunk in remaining.chunks(4) {
+            let metadata = &chunk[0];
+            let mint = &chunk[1];
+            let token_account = &chunk[2];
+            let master_edition = &chunk[3];
 
-        invoke(
-            &ix,
-            &[
-                ctx.accounts.metadata.to_account_info(),
-                owner_info.clone(),
-                ctx.accounts.mint.to_account_info(),
-                ctx.accounts.token_account.to_account_info(),
-                ctx.accounts.master_edition.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
-            ],
-        )?;
+            let ix = Instruction {
+                program_id: METAPLEX_METADATA_PROGRAM,
+                accounts: vec![
+                    AccountMeta::new(metadata.key(), false),
+                    AccountMeta::new(ctx.accounts.owner.key(), true),
+                    AccountMeta::new(mint.key(), false),
+                    AccountMeta::new(token_account.key(), false),
+                    AccountMeta::new(master_edition.key(), false),
+                    AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                ],
+                data: vec![18],
+            };
+
+            invoke(
+                &ix,
+                &[
+                    metadata.to_account_info(),
+                    owner_info.clone(),
+                    mint.to_account_info(),
+                    token_account.to_account_info(),
+                    master_edition.to_account_info(),
+                    ctx.accounts.token_program.to_account_info(),
+                ],
+            )?;
+        }
 
         let rent_reclaimed = owner_info
             .lamports()
@@ -244,11 +319,11 @@ pub mod chiefburner {
             **cranker_info.try_borrow_mut_lamports()? += rent_reclaimed;
         }
 
-        emit!(NftBurned {
+        emit!(NftsBurned {
             owner: ctx.accounts.owner.key(),
-            mint: ctx.accounts.mint.key(),
             cranker: ctx.accounts.cranker.key(),
-            rent_reclaimed,
+            count: (remaining.len() / 4) as u32,
+            total_rent_reclaimed: rent_reclaimed,
             cranker_fee: rent_reclaimed,
         });
 
@@ -256,88 +331,96 @@ pub mod chiefburner {
     }
 
     // ── Domain instructions (SPL Name Service) ──────────────────────
+    //
+    // remaining_accounts: name_accounts to delete (one per entry).
 
-    /// Delete a .sol domain and split recovered rent (~0.003 SOL).
-    /// 5% to cranker, 95% to owner.
+    /// Batch delete .sol domains. 5% to cranker, 95% to owner.
     pub fn delete_domain(ctx: Context<DeleteDomain>) -> Result<()> {
+        let remaining = &ctx.remaining_accounts;
+        require!(!remaining.is_empty(), ChiefburnerError::InvalidBatch);
+
         let owner_info = ctx.accounts.owner.to_account_info();
         let lamports_before = owner_info.lamports();
 
-        // CPI: Name Service Delete (instruction discriminator = 3)
-        let ix = Instruction {
-            program_id: NAME_SERVICE_PROGRAM,
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.name_account.key(), false),
-                AccountMeta::new(ctx.accounts.owner.key(), true),
-                AccountMeta::new(ctx.accounts.refund_target.key(), false),
-            ],
-            data: vec![3], // Delete discriminator
-        };
+        for name_account in remaining.iter() {
+            let ix = Instruction {
+                program_id: NAME_SERVICE_PROGRAM,
+                accounts: vec![
+                    AccountMeta::new(name_account.key(), false),
+                    AccountMeta::new(ctx.accounts.owner.key(), true),
+                    AccountMeta::new(ctx.accounts.owner.key(), false),
+                ],
+                data: vec![3],
+            };
 
-        invoke(
-            &ix,
-            &[
-                ctx.accounts.name_account.to_account_info(),
-                owner_info.clone(),
-                ctx.accounts.refund_target.to_account_info(),
-            ],
-        )?;
+            invoke(
+                &ix,
+                &[
+                    name_account.to_account_info(),
+                    owner_info.clone(),
+                ],
+            )?;
+        }
 
-        let rent_reclaimed = ctx
-            .accounts
-            .refund_target
-            .to_account_info()
+        let rent_reclaimed = owner_info
             .lamports()
             .checked_sub(lamports_before)
             .unwrap_or(0);
 
         let cranker_fee = transfer_cranker_fee(
-            &ctx.accounts.refund_target.to_account_info(),
+            &owner_info,
             &ctx.accounts.cranker,
             rent_reclaimed,
         )?;
 
-        emit!(DomainDeleted {
+        emit!(DomainsDeleted {
             owner: ctx.accounts.owner.key(),
-            name_account: ctx.accounts.name_account.key(),
             cranker: ctx.accounts.cranker.key(),
-            rent_reclaimed,
+            count: remaining.len() as u32,
+            total_rent_reclaimed: rent_reclaimed,
             cranker_fee,
         });
 
         Ok(())
     }
 
-    /// Delete a .sol domain. All recovered rent goes to cranker.
+    /// Batch delete .sol domains. All recovered rent goes to cranker.
     pub fn delete_domain_free(ctx: Context<DeleteDomainFree>) -> Result<()> {
-        // Name Service refunds to a target account — send directly to cranker
-        let ix = Instruction {
-            program_id: NAME_SERVICE_PROGRAM,
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.name_account.key(), false),
-                AccountMeta::new(ctx.accounts.owner.key(), true),
-                AccountMeta::new(ctx.accounts.cranker.key(), false),
-            ],
-            data: vec![3],
-        };
+        let remaining = &ctx.remaining_accounts;
+        require!(!remaining.is_empty(), ChiefburnerError::InvalidBatch);
 
-        let name_lamports = ctx.accounts.name_account.to_account_info().lamports();
+        let mut total_rent: u64 = 0;
 
-        invoke(
-            &ix,
-            &[
-                ctx.accounts.name_account.to_account_info(),
-                ctx.accounts.owner.to_account_info(),
-                ctx.accounts.cranker.to_account_info(),
-            ],
-        )?;
+        for name_account in remaining.iter() {
+            let rent = name_account.lamports();
+            total_rent = total_rent.checked_add(rent).unwrap();
 
-        emit!(DomainDeleted {
+            let ix = Instruction {
+                program_id: NAME_SERVICE_PROGRAM,
+                accounts: vec![
+                    AccountMeta::new(name_account.key(), false),
+                    AccountMeta::new(ctx.accounts.owner.key(), true),
+                    AccountMeta::new(ctx.accounts.cranker.key(), false),
+                ],
+                data: vec![3],
+            };
+
+            invoke(
+                &ix,
+                &[
+                    name_account.to_account_info(),
+                    ctx.accounts.owner.to_account_info(),
+                    ctx.accounts.cranker.to_account_info(),
+                ],
+            )?;
+        }
+
+        emit!(DomainsDeleted {
             owner: ctx.accounts.owner.key(),
-            name_account: ctx.accounts.name_account.key(),
             cranker: ctx.accounts.cranker.key(),
-            rent_reclaimed: name_lamports,
-            cranker_fee: name_lamports,
+            count: remaining.len() as u32,
+            total_rent_reclaimed: total_rent,
+            cranker_fee: total_rent,
         });
 
         Ok(())
@@ -348,54 +431,30 @@ pub mod chiefburner {
 
 #[derive(Accounts)]
 pub struct BurnAndClose<'info> {
-    /// The token account to close.
-    #[account(
-        mut,
-        token::mint = mint,
-        token::authority = owner,
-    )]
-    pub token_account: InterfaceAccount<'info, TokenAccount>,
-
-    /// The mint of the token account.
-    #[account(mut)]
-    pub mint: InterfaceAccount<'info, Mint>,
-
-    /// The owner of the token account. Must sign to authorize.
+    /// The owner of all token accounts. Must sign.
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// The cranker. Receives 5% of reclaimed rent.
+    /// The cranker. Receives 5% of total reclaimed rent.
     /// CHECK: Any account can be the cranker.
     #[account(mut)]
     pub cranker: UncheckedAccount<'info>,
 
-    /// The token program (supports both Token and Token-2022).
+    /// The token program (all accounts in batch must use the same program).
     pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
 pub struct BurnAndCloseFree<'info> {
-    /// The token account to close.
-    #[account(
-        mut,
-        token::mint = mint,
-        token::authority = owner,
-    )]
-    pub token_account: InterfaceAccount<'info, TokenAccount>,
-
-    /// The mint of the token account.
-    #[account(mut)]
-    pub mint: InterfaceAccount<'info, Mint>,
-
-    /// The owner of the token account. Must sign to authorize.
+    /// The owner of all token accounts. Must sign.
     pub owner: Signer<'info>,
 
-    /// The cranker. Receives 100% of reclaimed rent.
+    /// The cranker. Receives 100% of total reclaimed rent.
     /// CHECK: Any account can be the cranker.
     #[account(mut)]
     pub cranker: UncheckedAccount<'info>,
 
-    /// The token program (supports both Token and Token-2022).
+    /// The token program (all accounts in batch must use the same program).
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -405,73 +464,12 @@ pub struct BurnNft<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// The cranker. Receives 5% of recovered rent.
+    /// The cranker.
     /// CHECK: Any account can be the cranker.
     #[account(mut)]
     pub cranker: UncheckedAccount<'info>,
 
-    /// The NFT mint.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-
-    /// The token account holding the NFT.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub token_account: UncheckedAccount<'info>,
-
-    /// The metadata PDA.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
-
-    /// The master edition PDA.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub master_edition: UncheckedAccount<'info>,
-
-    /// SPL Token program.
-    /// CHECK: Validated by Metaplex CPI.
-    pub token_program: UncheckedAccount<'info>,
-
-    /// Metaplex Token Metadata program.
-    /// CHECK: Must be the Metaplex program.
-    #[account(address = METAPLEX_METADATA_PROGRAM)]
-    pub metadata_program: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct BurnNftFree<'info> {
-    /// The NFT owner. Must sign.
-    #[account(mut)]
-    pub owner: Signer<'info>,
-
-    /// The cranker. Receives 100% of recovered rent.
-    /// CHECK: Any account can be the cranker.
-    #[account(mut)]
-    pub cranker: UncheckedAccount<'info>,
-
-    /// The NFT mint.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-
-    /// The token account holding the NFT.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub token_account: UncheckedAccount<'info>,
-
-    /// The metadata PDA.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
-
-    /// The master edition PDA.
-    /// CHECK: Validated by Metaplex CPI.
-    #[account(mut)]
-    pub master_edition: UncheckedAccount<'info>,
-
-    /// SPL Token program.
+    /// SPL Token program (used by Metaplex CPI).
     /// CHECK: Validated by Metaplex CPI.
     pub token_program: UncheckedAccount<'info>,
 
@@ -487,20 +485,10 @@ pub struct DeleteDomain<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// The cranker. Receives 5% of recovered rent.
+    /// The cranker. Receives 5% of total recovered rent.
     /// CHECK: Any account can be the cranker.
     #[account(mut)]
     pub cranker: UncheckedAccount<'info>,
-
-    /// The name account (domain) to delete.
-    /// CHECK: Validated by Name Service CPI.
-    #[account(mut)]
-    pub name_account: UncheckedAccount<'info>,
-
-    /// The account to receive the refund (owner).
-    /// CHECK: Receives rent refund from Name Service.
-    #[account(mut, address = owner.key())]
-    pub refund_target: UncheckedAccount<'info>,
 
     /// SPL Name Service program.
     /// CHECK: Must be the Name Service program.
@@ -511,18 +499,12 @@ pub struct DeleteDomain<'info> {
 #[derive(Accounts)]
 pub struct DeleteDomainFree<'info> {
     /// The domain owner. Must sign.
-    #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// The cranker. Receives 100% of recovered rent.
+    /// The cranker. Receives 100% of total recovered rent.
     /// CHECK: Any account can be the cranker.
     #[account(mut)]
     pub cranker: UncheckedAccount<'info>,
-
-    /// The name account (domain) to delete.
-    /// CHECK: Validated by Name Service CPI.
-    #[account(mut)]
-    pub name_account: UncheckedAccount<'info>,
 
     /// SPL Name Service program.
     /// CHECK: Must be the Name Service program.
@@ -533,30 +515,29 @@ pub struct DeleteDomainFree<'info> {
 // ── Events ──────────────────────────────────────────────────────────
 
 #[event]
-pub struct AccountClosed {
-    pub token_account: Pubkey,
-    pub mint: Pubkey,
+pub struct TokensBurned {
     pub owner: Pubkey,
     pub cranker: Pubkey,
-    pub rent_reclaimed: u64,
+    pub count: u32,
+    pub total_rent_reclaimed: u64,
     pub cranker_fee: u64,
 }
 
 #[event]
-pub struct NftBurned {
+pub struct NftsBurned {
     pub owner: Pubkey,
-    pub mint: Pubkey,
     pub cranker: Pubkey,
-    pub rent_reclaimed: u64,
+    pub count: u32,
+    pub total_rent_reclaimed: u64,
     pub cranker_fee: u64,
 }
 
 #[event]
-pub struct DomainDeleted {
+pub struct DomainsDeleted {
     pub owner: Pubkey,
-    pub name_account: Pubkey,
     pub cranker: Pubkey,
-    pub rent_reclaimed: u64,
+    pub count: u32,
+    pub total_rent_reclaimed: u64,
     pub cranker_fee: u64,
 }
 
@@ -564,6 +545,8 @@ pub struct DomainDeleted {
 
 #[error_code]
 pub enum ChiefburnerError {
-    #[msg("Token account close did not succeed")]
-    CloseDidNotSucceed,
+    #[msg("Invalid or mismatched account")]
+    InvalidAccount,
+    #[msg("Invalid batch: wrong number of remaining accounts")]
+    InvalidBatch,
 }
