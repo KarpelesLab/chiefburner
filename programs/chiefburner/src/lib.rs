@@ -59,7 +59,7 @@ pub mod chiefburner {
 
     /// Batch burn tokens and close accounts.
     /// Splits reclaimed rent: 5% to cranker, 95% to owner.
-    pub fn burn_and_close(ctx: Context<BurnAndClose>) -> Result<()> {
+    pub fn burn_and_close<'info>(ctx: Context<'_, '_, 'info, 'info, BurnAndClose<'info>>) -> Result<()> {
         let remaining = &ctx.remaining_accounts;
         require!(
             remaining.len() >= 2 && remaining.len() % 2 == 0,
@@ -131,7 +131,7 @@ pub mod chiefburner {
 
     /// Batch burn tokens and close accounts.
     /// All reclaimed rent goes to the cranker.
-    pub fn burn_and_close_free(ctx: Context<BurnAndCloseFree>) -> Result<()> {
+    pub fn burn_and_close_free<'info>(ctx: Context<'_, '_, 'info, 'info, BurnAndCloseFree<'info>>) -> Result<()> {
         let remaining = &ctx.remaining_accounts;
         require!(
             remaining.len() >= 2 && remaining.len() % 2 == 0,
@@ -201,7 +201,7 @@ pub mod chiefburner {
     //   (metadata, mint, token_account, master_edition)
 
     /// Batch burn NFTs via Metaplex. 5% to cranker, 95% to owner.
-    pub fn burn_nft(ctx: Context<BurnNft>) -> Result<()> {
+    pub fn burn_nft<'info>(ctx: Context<'_, '_, 'info, 'info, BurnNft<'info>>) -> Result<()> {
         let remaining = &ctx.remaining_accounts;
         require!(
             remaining.len() >= 4 && remaining.len() % 4 == 0,
@@ -266,7 +266,7 @@ pub mod chiefburner {
     }
 
     /// Batch burn NFTs via Metaplex. All recovered rent to cranker.
-    pub fn burn_nft_free(ctx: Context<BurnNft>) -> Result<()> {
+    pub fn burn_nft_free<'info>(ctx: Context<'_, '_, 'info, 'info, BurnNft<'info>>) -> Result<()> {
         let remaining = &ctx.remaining_accounts;
         require!(
             remaining.len() >= 4 && remaining.len() % 4 == 0,
@@ -335,7 +335,7 @@ pub mod chiefburner {
     // remaining_accounts: name_accounts to delete (one per entry).
 
     /// Batch delete .sol domains. 5% to cranker, 95% to owner.
-    pub fn delete_domain(ctx: Context<DeleteDomain>) -> Result<()> {
+    pub fn delete_domain<'info>(ctx: Context<'_, '_, 'info, 'info, DeleteDomain<'info>>) -> Result<()> {
         let remaining = &ctx.remaining_accounts;
         require!(!remaining.is_empty(), ChiefburnerError::InvalidBatch);
 
@@ -385,7 +385,7 @@ pub mod chiefburner {
     }
 
     /// Batch delete .sol domains. All recovered rent goes to cranker.
-    pub fn delete_domain_free(ctx: Context<DeleteDomainFree>) -> Result<()> {
+    pub fn delete_domain_free<'info>(ctx: Context<'_, '_, 'info, 'info, DeleteDomainFree<'info>>) -> Result<()> {
         let remaining = &ctx.remaining_accounts;
         require!(!remaining.is_empty(), ChiefburnerError::InvalidBatch);
 
